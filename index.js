@@ -203,9 +203,27 @@ app.get("/webhook", (req, res) => {
 
 // WhatsApp webhook receiver (POST)
 app.post("/webhook", (req, res) => {
-  console.log("Incoming WhatsApp webhook:", JSON.stringify(req.body, null, 2));
+  try {
+    const body = req.body;
+
+    const msg =
+      body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
+
+    const text = msg?.text?.body;
+    const from = msg?.from;
+
+    if (text) {
+      console.log("WA REAL MSG:", { from, text });
+    } else {
+      console.log("WA EVENT (no text):", JSON.stringify(body));
+    }
+  } catch (e) {
+    console.log("WA WEBHOOK PARSE ERROR:", e?.message);
+  }
+
   return res.sendStatus(200);
 });
+
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
