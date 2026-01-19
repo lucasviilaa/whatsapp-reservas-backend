@@ -240,6 +240,7 @@ app.get("/webhook", (req, res) => {
 });
 
 // WhatsApp webhook receiver (POST)
+// WhatsApp webhook receiver (POST)
 app.post("/webhook", async (req, res) => {
   try {
     const body = req.body;
@@ -282,6 +283,7 @@ app.post("/webhook", async (req, res) => {
             "2️⃣ Cancelar reserva\n" +
             "3️⃣ Horarios y locales";
         }
+
       } else if (session.state === "ASK_RESTAURANT") {
         let code = null;
         if (normalized === "1" || normalized === "deliclub") code = "deliclub";
@@ -291,9 +293,35 @@ app.post("/webhook", async (req, res) => {
         if (!code) {
           reply = "No entendí. Respondé con 1, 2 o 3 (o escribí deliclub / brodo-pasta / brodo-pizza).";
         } else {
-          await upsertSession(wa_id, { state: "IDLE", restaurant_code: code });
-          reply = `✅ Perfecto. Elegiste *${code}*.\n\n(En el próximo paso te pido cantidad de personas).`;
+          await upsertSession(wa_id, {
+            state: "ASK_PARTY_SIZE",
+            restaurant_code: code,
+          });
+
+          reply =
+            `✅ Perfecto. Elegiste *${code}*.\n\n` +
+            "👥 ¿Para cuántas personas es la reserva?\n" +
+            "Respondé con un número (ej: 2, 4, 6).";
         }
+
+      } else if (session.state === "ASK_PARTY_SIZE") {
+        const n = parseInt(normalized, 10);
+
+        if (Number.isNaN(n) || n < 1 || n > 50) {
+          reply =
+            "❌ Cantidad inválida.\n\n" +
+            "Respondé con un número entre 1 y 50.";
+        } else {
+          await upsertSession(wa_id, {
+            state: "IDLE",
+            party_size: n,
+          });
+
+          reply =
+            `👥 Perfecto, ${n} personas.\n\n` +
+            "(En el próximo paso te voy a pedir la fecha de la reserva).";
+        }
+
       } else {
         await upsertSession(wa_id, { state: "IDLE" });
         reply =
@@ -301,7 +329,9 @@ app.post("/webhook", async (req, res) => {
           "Escribí:\n1️⃣ Reservar\n2️⃣ Cancelar\n3️⃣ Horarios";
       }
 
-      await sendWhatsAppText(wa_id, reply); // <-- solo una vez
+      // Enviar respuesta (una sola vez)
+      await sendWhatsAppText(wa_id, reply);
+
     } else {
       console.log("WA EVENT (no text):", JSON.stringify(body));
     }
@@ -311,6 +341,7 @@ app.post("/webhook", async (req, res) => {
 
   return res.sendStatus(200);
 });
+
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
