@@ -248,10 +248,27 @@ app.post("/webhook", async (req, res) => {
     if (text && from) {
       console.log("WA REAL MSG:", { from, text });
 
-      await sendWhatsAppText(
-        from,
-        "Hola 👋 Soy el asistente de reservas. Escribí RESERVAR para comenzar."
-      );
+      const normalized = text.trim().toLowerCase();
+
+let reply;
+
+if (normalized === "1") {
+  reply = "📅 Perfecto. Vamos a hacer una reserva.\n\n(En el próximo paso te voy a pedir el restaurante)";
+} else if (normalized === "2") {
+  reply = "❌ Para cancelar una reserva, necesitás el código.\n\n(Este flujo lo hacemos en el próximo paso)";
+} else if (normalized === "3") {
+  reply = "📍 Tenemos 3 locales:\n\n🥩 DeliClub\n🍝 Brodo Pasta\n🍕 Brodo Pizza";
+} else {
+  reply =
+    "👋 Bienvenido al sistema de reservas\n\n" +
+    "Escribí una opción:\n" +
+    "1️⃣ Reservar mesa\n" +
+    "2️⃣ Cancelar reserva\n" +
+    "3️⃣ Horarios y locales";
+}
+
+await sendWhatsAppText(from, reply);
+
     } else {
       // statuses u otros eventos
       console.log("WA EVENT (no text):", JSON.stringify(body));
