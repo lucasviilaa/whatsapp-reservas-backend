@@ -186,6 +186,27 @@ app.post("/cancel", async (req, res) => {
   return res.json({ ok: true, reservation: data[0] });
 });
 
+// WhatsApp webhook verification (GET)
+app.get("/webhook", (req, res) => {
+  const mode = req.query["hub.mode"];
+  const token = req.query["hub.verify_token"];
+  const challenge = req.query["hub.challenge"];
+
+  const expectedToken = process.env.WHATSAPP_VERIFY_TOKEN;
+
+  if (mode === "subscribe" && token === expectedToken) {
+    return res.status(200).send(challenge);
+  }
+
+  return res.sendStatus(403);
+});
+
+// WhatsApp webhook receiver (POST)
+app.post("/webhook", (req, res) => {
+  console.log("Incoming WhatsApp webhook:", JSON.stringify(req.body, null, 2));
+  return res.sendStatus(200);
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
