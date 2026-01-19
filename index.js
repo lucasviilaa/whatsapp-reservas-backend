@@ -17,6 +17,40 @@ if (!supabaseUrl || !supabaseAnonKey) {
 }
 
 const supabase = createClient(supabaseUrl, supabaseAnonKey);
+async function sendWhatsAppText(to, text) {
+  const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID;
+  const token = process.env.WHATSAPP_ACCESS_TOKEN;
+
+  if (!phoneNumberId || !token) {
+    console.log("Missing WHATSAPP_PHONE_NUMBER_ID or WHATSAPP_ACCESS_TOKEN");
+    return { ok: false, error: "missing_whatsapp_env" };
+  }
+
+  const url = `https://graph.facebook.com/v22.0/${phoneNumberId}/messages`;
+
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      messaging_product: "whatsapp",
+      to,
+      type: "text",
+      text: { body: text },
+    }),
+  });
+
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    console.log("WhatsApp send error:", resp.status, data);
+    return { ok: false, status: resp.status, data };
+  }
+
+  return { ok: true, data };
+}
+
 
 app.get("/health", (req, res) => {
   res.json({ ok: true });
@@ -202,28 +236,32 @@ app.get("/webhook", (req, res) => {
 });
 
 // WhatsApp webhook receiver (POST)
-app.post("/webhook", (req, res) => {
+
+app.post("/webhook", async (req, res) => {
   try {
     const body = req.body;
 
-    const msg =
-      body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
-
+    const msg = body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
     const text = msg?.text?.body;
     const from = msg?.from;
 
-    if (text) {
+    if (text && from) {
       console.log("WA REAL MSG:", { from, text });
+
+      await sendWhatsAppText(
+        from,
+        "Hola 👋 Soy el asistente de reservas. Escribí RESERVAR para comenzar."
+      );
     } else {
+      // statuses u otros eventos
       console.log("WA EVENT (no text):", JSON.stringify(body));
     }
   } catch (e) {
-    console.log("WA WEBHOOK PARSE ERROR:", e?.message);
+    console.log("WA WEBHOOK ERROR:", e?.message);
   }
 
   return res.sendStatus(200);
 });
-
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
