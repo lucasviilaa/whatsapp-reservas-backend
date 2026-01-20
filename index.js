@@ -63,7 +63,6 @@ function localsText() {
 
 function formatAlternatives(alts) {
   if (!alts || alts.length === 0) return "No encontré alternativas en los próximos días.";
-  // Mostramos hasta 3
   const top = alts.slice(0, 3);
   const lines = top.map(
     (a, i) => `${i + 1}) ${a.service_date} — ${a.service === "LUNCH" ? "Lunch" : "Dinner"}`
@@ -110,7 +109,7 @@ async function sendWhatsAppText(to, text) {
 
 // -------------------------
 // Session helpers (SQL)
-// chat_sessions: wa_id PK, state, restaurant_code, party_size, service_date, service, updated_at
+// chat_sessions: wa_id PK, state, restaurant_code, party_size, service_date, service, cancel_ids(jsonb), updated_at
 // -------------------------
 async function getSession(wa_id) {
   const { data, error } = await supabase
@@ -143,6 +142,7 @@ async function resetSession(wa_id) {
     party_size: null,
     service_date: null,
     service: null,
+    cancel_ids: null,
   });
 }
 
@@ -297,10 +297,57 @@ app.post("/cancel", async (req, res) => {
     .select("id,status");
 
   if (error) return res.status(500).json({ ok: false, error: error.message });
-  if (!data || data.length === 0) return res.status(404).json({ ok: false, error: "Reservation not found" });
+  if (!data || data.length === 0)
+    return res.status(404).json({ ok: false, error: "Reservation not found" });
 
   return res.json({ ok: true, reservation: data[0] });
 });
+
+// -------------------------
+// Cancel helpers (WhatsApp flow)
+// -------------------------
+async function listUpcomingReservationsForWa(wa_id, limit = 5) {
+  const today = new Date();
+  const yyyy = today.getFullYear();
+  const mm = String(today.getMonth() + 1).padStart(2, "0");
+  const dd = String(today.getDate()).padStart(2, "0");
+  const todayIso = `${yyyy}-${mm}-${dd}`;
+
+  const { data, error } = await supabase
+    .from("reservations")
+    .select("id, party_size, service_date, service, status, restaurant_id, created_at")
+    .eq("customer_phone", wa_id)
+    .eq("status", "CONFIRMED")
+    .gte("service_date", todayIso)
+    .order("service_date", { ascending: true })
+    .order("created_at", { ascending: false })
+    .limit(limit);
+
+  if (error) throw error;
+  return data || [];
+}
+
+async function getRestaurantCodeById(restaurant_id) {
+  const { data, error } = await supabase
+    .from("restaurants")
+    .select("code")
+    .eq("id", restaurant_id)
+    .limit(1);
+
+  if (error) throw error;
+  return data?.[0]?.code || null;
+}
+
+async function cancelReservationById(id) {
+  const { data, error } = await supabase
+    .from("reservations")
+    .update({ status: "CANCELLED" })
+    .eq("id", id)
+    .select("id,status");
+
+  if (error) throw error;
+  return data?.[0] || null;
+}
 
 // -------------------------
 // WhatsApp webhook verification (GET)
@@ -325,13 +372,11 @@ app.post("/webhook", async (req, res) => {
   try {
     const body = req.body;
 
-    // WhatsApp puede enviar statuses y otros eventos. Solo procesamos mensajes entrantes.
     const msg = body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
     const text = msg?.text?.body;
     const from = msg?.from;
 
     if (!text || !from) {
-      // logs útiles, pero no respondemos
       console.log("WA EVENT (no inbound text):", JSON.stringify(body));
       return res.sendStatus(200);
     }
@@ -369,24 +414,71 @@ app.post("/webhook", async (req, res) => {
           "3) brodo-pizza\n\n" +
           "Respondé con 1, 2 o 3.";
       } else if (normalized === "2" || normalized === "cancelar") {
-        await upsertSession(wa_id, { state: "ASK_CANCEL_ID" });
-        reply =
-          "❌ Cancelar reserva\n\n" +
-          "Enviame el *código de reserva* (UUID) que te dimos al confirmar.\n" +
-          "Ejemplo: f15db596-52b3-4bf7-a040-ad3d51e6e2db\n\n" +
-          "Tip: escribí *menu* para volver.";
+        const upcoming = await listUpcomingReservationsForWa(wa_id, 3);
+
+        if (!upcoming.length) {
+          reply = "No encontré reservas futuras a tu nombre ✅\n\n" + MENU_TEXT;
+          await resetSession(wa_id);
+        } else {
+          // Guardamos en sesión el mapping pick -> reservation_id
+          await upsertSession(wa_id, {
+            state: "ASK_CANCEL_PICK",
+            cancel_ids: upcoming.map((r) => r.id),
+          });
+
+          const lines = [];
+          for (let i = 0; i < upcoming.length; i++) {
+            const r = upcoming[i];
+            const code = await getRestaurantCodeById(r.restaurant_id);
+            lines.push(
+              `${i + 1}) ${restaurantLabel(code)} — ${r.service_date} — ${
+                r.service === "LUNCH" ? "Lunch" : "Dinner"
+              } — ${r.party_size} pax`
+            );
+          }
+
+          reply =
+            "❌ Cancelar reserva\n\n" +
+            "Elegí cuál querés cancelar:\n" +
+            lines.join("\n") +
+            "\n\nRespondé con 1, 2 o 3.\n" +
+            "O escribí *menu* para salir.";
+        }
       } else if (normalized === "3" || normalized === "locales" || normalized === "horarios") {
         reply = localsText();
       } else {
         reply = MENU_TEXT;
       }
-    }
+    } else if (session.state === "ASK_CANCEL_PICK") {
+      if (normalized === "menu") {
+        await resetSession(wa_id);
+        reply = MENU_TEXT;
+      } else {
+        const pick = parseInt(normalized, 10);
+        const ids = Array.isArray(session.cancel_ids) ? session.cancel_ids : [];
 
-    else if (session.state === "ASK_RESTAURANT") {
+        if (Number.isNaN(pick) || pick < 1 || pick > ids.length) {
+          reply = "Respondé con 1, 2 o 3 (o escribí *menu*).";
+        } else {
+          const idToCancel = ids[pick - 1];
+          const cancelled = await cancelReservationById(idToCancel);
+
+          await resetSession(wa_id);
+
+          if (!cancelled) {
+            reply = "⚠️ No encontré esa reserva. Escribí *menu* para volver.";
+          } else {
+            reply = "✅ Reserva cancelada.\n\n" + MENU_TEXT;
+          }
+        }
+      }
+    } else if (session.state === "ASK_RESTAURANT") {
       let code = null;
       if (normalized === "1" || normalized === "deliclub") code = "deliclub";
-      if (normalized === "2" || normalized === "brodo-pasta" || normalized === "pasta") code = "brodo-pasta";
-      if (normalized === "3" || normalized === "brodo-pizza" || normalized === "pizza") code = "brodo-pizza";
+      if (normalized === "2" || normalized === "brodo-pasta" || normalized === "pasta")
+        code = "brodo-pasta";
+      if (normalized === "3" || normalized === "brodo-pizza" || normalized === "pizza")
+        code = "brodo-pizza";
 
       if (!code) {
         reply =
@@ -407,15 +499,11 @@ app.post("/webhook", async (req, res) => {
           "👥 ¿Para cuántas personas es la reserva?\n" +
           "Respondé con un número (ej: 2, 4, 6).";
       }
-    }
-
-    else if (session.state === "ASK_PARTY_SIZE") {
+    } else if (session.state === "ASK_PARTY_SIZE") {
       const n = parseInt(normalized, 10);
 
       if (Number.isNaN(n) || n < 1 || n > 50) {
-        reply =
-          "❌ Cantidad inválida.\n\n" +
-          "Respondé con un número entre 1 y 50.";
+        reply = "❌ Cantidad inválida.\n\n" + "Respondé con un número entre 1 y 50.";
       } else {
         await upsertSession(wa_id, { state: "ASK_DATE", party_size: n });
         reply =
@@ -423,9 +511,7 @@ app.post("/webhook", async (req, res) => {
           "📅 ¿Para qué fecha es la reserva?\n" +
           "Respondé con formato YYYY-MM-DD (ej: 2026-01-25).";
       }
-    }
-
-    else if (session.state === "ASK_DATE") {
+    } else if (session.state === "ASK_DATE") {
       const date = normalized;
 
       if (!isISODate(date)) {
@@ -434,15 +520,9 @@ app.post("/webhook", async (req, res) => {
           "Usá el formato YYYY-MM-DD (ej: 2026-01-25).";
       } else {
         await upsertSession(wa_id, { state: "ASK_SERVICE", service_date: date });
-        reply =
-          "🍽️ ¿En qué servicio?\n\n" +
-          "1️⃣ Lunch\n" +
-          "2️⃣ Dinner\n\n" +
-          "Respondé con 1 o 2.";
+        reply = "🍽️ ¿En qué servicio?\n\n" + "1️⃣ Lunch\n" + "2️⃣ Dinner\n\n" + "Respondé con 1 o 2.";
       }
-    }
-
-    else if (session.state === "ASK_SERVICE") {
+    } else if (session.state === "ASK_SERVICE") {
       let service = null;
       if (normalized === "1" || normalized === "lunch") service = "LUNCH";
       if (normalized === "2" || normalized === "dinner") service = "DINNER";
@@ -450,7 +530,6 @@ app.post("/webhook", async (req, res) => {
       if (!service) {
         reply = "❌ Respondé con 1 (Lunch) o 2 (Dinner).";
       } else {
-        // Guardamos el servicio y pasamos a confirmar / crear
         session = await upsertSession(wa_id, { state: "CONFIRM_RESERVATION", service });
 
         const r = session.restaurant_code;
@@ -469,16 +548,13 @@ app.post("/webhook", async (req, res) => {
           "3️⃣ Cambiar servicio\n" +
           "4️⃣ Cancelar";
       }
-    }
-
-    else if (session.state === "CONFIRM_RESERVATION") {
+    } else if (session.state === "CONFIRM_RESERVATION") {
       if (normalized === "4" || normalized === "cancelar") {
         await resetSession(wa_id);
         reply = "Listo ✅ Cancelé el proceso.\n\n" + MENU_TEXT;
       } else if (normalized === "2") {
         await upsertSession(wa_id, { state: "ASK_DATE" });
-        reply =
-          "📅 Ok. Enviame la nueva fecha en formato YYYY-MM-DD (ej: 2026-01-25).";
+        reply = "📅 Ok. Enviame la nueva fecha en formato YYYY-MM-DD (ej: 2026-01-25).";
       } else if (normalized === "3") {
         await upsertSession(wa_id, { state: "ASK_SERVICE" });
         reply =
@@ -487,7 +563,6 @@ app.post("/webhook", async (req, res) => {
           "2️⃣ Dinner\n\n" +
           "Respondé con 1 o 2.";
       } else if (normalized === "1" || normalized === "confirmar") {
-        // 1) Check availability
         const r = session.restaurant_code;
         const d = session.service_date;
         const s = session.service;
@@ -506,8 +581,6 @@ app.post("/webhook", async (req, res) => {
           const avail = Array.isArray(availData) ? availData[0] : availData;
 
           if (avail?.ok === true) {
-            // 2) Create reservation
-            // buscar restaurant_id
             const { data: restaurantRows, error: restaurantError } = await supabase
               .from("restaurants")
               .select("id")
@@ -536,7 +609,6 @@ app.post("/webhook", async (req, res) => {
               if (insertError || !insertData?.length) {
                 reply = "⚠️ No pude crear la reserva. Probá de nuevo con *menu*.";
               } else {
-                const reservationId = insertData[0].id;
                 await resetSession(wa_id);
 
                 reply =
@@ -545,13 +617,11 @@ app.post("/webhook", async (req, res) => {
                   `Personas: *${p}*\n` +
                   `Fecha: *${d}*\n` +
                   `Servicio: *${s === "LUNCH" ? "Lunch" : "Dinner"}*\n\n` +
-                  `📌 Código de reserva:\n${reservationId}\n\n` +
                   "Para cancelar más tarde, elegí 2 en el menú.\n\n" +
                   MENU_TEXT;
               }
             }
           } else {
-            // No available -> suggest alternatives
             const { data: altData, error: altError } = await supabase.rpc("suggest_alternatives", {
               p_restaurant_code: r,
               p_service_date: d,
@@ -579,14 +649,11 @@ app.post("/webhook", async (req, res) => {
       } else {
         reply = "Respondé con 1, 2, 3 o 4.";
       }
-    }
-
-    else if (session.state === "ASK_ALT_PICK") {
+    } else if (session.state === "ASK_ALT_PICK") {
       const pick = parseInt(normalized, 10);
       if (Number.isNaN(pick) || pick < 1 || pick > 3) {
         reply = "Respondé con 1, 2 o 3 para elegir una alternativa (o *menu*).";
       } else {
-        // Recalcular alternativas con los datos guardados y elegir la N
         const r = session.restaurant_code;
         const d = session.service_date;
         const s = session.service;
@@ -602,12 +669,9 @@ app.post("/webhook", async (req, res) => {
 
         if (altError || !altData?.length || !altData[pick - 1]) {
           await resetSession(wa_id);
-          reply =
-            "⚠️ No pude tomar esa alternativa.\n\n" +
-            "Escribí *menu* para intentar de nuevo.";
+          reply = "⚠️ No pude tomar esa alternativa.\n\n" + "Escribí *menu* para intentar de nuevo.";
         } else {
           const chosen = altData[pick - 1];
-          // Actualizamos date/service y volvemos a confirmar directo
           await upsertSession(wa_id, {
             state: "CONFIRM_RESERVATION",
             service_date: chosen.service_date,
@@ -621,49 +685,11 @@ app.post("/webhook", async (req, res) => {
             "Respondé 1️⃣ para *Confirmar* o *menu* para cancelar.";
         }
       }
-    }
-
-    else if (session.state === "ASK_CANCEL_ID") {
-      const id = normalized;
-      if (!isUUID(id)) {
-        reply =
-          "❌ Ese código no parece válido.\n\n" +
-          "Pegá el código completo (UUID) tal cual te llegó.\n" +
-          "Tip: escribí *menu* para volver.";
-      } else {
-        const { data, error } = await supabase
-          .from("reservations")
-          .update({ status: "CANCELLED" })
-          .eq("id", id)
-          .select("id,status")
-          .limit(1);
-
-        await resetSession(wa_id);
-
-        if (error) {
-          reply = "⚠️ Error cancelando la reserva. Probá de nuevo con *menu*.";
-        } else if (!data || data.length === 0) {
-          reply =
-            "No encontré una reserva con ese código.\n\n" +
-            MENU_TEXT;
-        } else {
-          reply =
-            "✅ Reserva cancelada.\n\n" +
-            `Código: ${data[0].id}\n\n` +
-            MENU_TEXT;
-        }
-      }
-    }
-
-    else {
-      // Estado desconocido -> reset
+    } else {
       await resetSession(wa_id);
-      reply =
-        "Reinicié la conversación por seguridad.\n\n" +
-        MENU_TEXT;
+      reply = "Reinicié la conversación por seguridad.\n\n" + MENU_TEXT;
     }
 
-    // Enviar respuesta (una sola vez)
     await sendWhatsAppText(wa_id, reply);
     return res.sendStatus(200);
   } catch (e) {
@@ -677,3 +703,4 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
 });
+
